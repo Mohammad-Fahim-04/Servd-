@@ -1,5 +1,6 @@
 import { Geist, Geist_Mono } from "next/font/google";
 import { ClerkProvider } from "@clerk/nextjs";
+import Header from "@/components/Header";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -25,7 +26,8 @@ export default function RootLayout({ children }) {
     >
       <body className="min-h-full flex flex-col">
         <ClerkProvider>
-          {children}
+          <Header />
+          <main className="min-h-screen">{children}</main>
         </ClerkProvider>
       </body>
     </html>

@@ -1,88 +1,181 @@
 "use server";
 
 import { checkUser } from "@/lib/checkUser";
-import { GoogleGenerativeAI } from "@google/generative-ai";
-import { freeMealRecommendations, proTierLimit } from "@/lib/arcjet";
+import { GoogleGenAI } from "@google/genai";
+import {
+  freeMealRecommendations,
+  proTierLimit,
+} from "@/lib/arcjet";
 import { request } from "@arcjet/next";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+
 const STRAPI_URL =
   process.env.NEXT_PUBLIC_STRAPI_URL || "http://localhost:1337";
+
 const STRAPI_API_TOKEN = process.env.STRAPI_API_TOKEN;
 const UNSPLASH_ACCESS_KEY = process.env.UNSPLASH_ACCESS_KEY;
 
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+if (!GEMINI_API_KEY) {
+  console.warn("GEMINI_API_KEY is missing");
+}
 
-// Helper function to normalize recipe title
+const genAI = new GoogleGenAI({
+  apiKey: GEMINI_API_KEY,
+});
+
+// IMPORTANT:
+// gemini-2.5-flash is giving 404 for your API key.
+// Use a currently available model.
+const GEMINI_MODEL = "gemini-3.6-flash";
+
+// -----------------------------
+// Helpers
+// -----------------------------
+
 function normalizeTitle(title) {
-  return title
+  return String(title || "")
     .trim()
-    .split(" ")
-    .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+    .split(/\s+/)
+    .map(
+      (word) =>
+        word.charAt(0).toUpperCase() +
+        word.slice(1).toLowerCase()
+    )
     .join(" ");
 }
 
-// Helper function to fetch image from Unsplash
+function normalizeCuisine(value) {
+  const cuisine = String(value || "")
+    .toLowerCase()
+    .trim();
+
+  const map = {
+    italian: "italian",
+    chinese: "chinese",
+    mexican: "mexican",
+    indian: "indian",
+    american: "american",
+    thai: "thai",
+    japanese: "japanese",
+    mediterranean: "mediterranean",
+    french: "french",
+    korean: "korean",
+    vietnamese: "vietnamese",
+    spanish: "spanish",
+    greek: "greek",
+    turkish: "turkish",
+    moroccan: "moroccan",
+    brazilian: "brazilian",
+    caribbean: "caribbean",
+    "middle-eastern": "middle - eastern",
+    "middle eastern": "middle - eastern",
+    "middle - eastern": "middle - eastern",
+    british: "british",
+    german: "german",
+    portuguese: "portuguese",
+    other: "other",
+  };
+
+  return map[cuisine] || "other";
+}
+
+function normalizeCategory(value) {
+  const categories = [
+    "breakfast",
+    "lunch",
+    "dinner",
+    "snack",
+    "dessert",
+  ];
+
+  const category = String(value || "")
+    .toLowerCase()
+    .trim();
+
+  return categories.includes(category) ? category : "dinner";
+}
+
+function cleanGeminiJSON(text) {
+  return String(text || "")
+    .replace(/```json/gi, "")
+    .replace(/```/g, "")
+    .trim();
+}
+
 async function fetchRecipeImage(recipeName) {
   try {
-    if (!UNSPLASH_ACCESS_KEY) {
-      console.warn("⚠️ UNSPLASH_ACCESS_KEY not set, skipping image fetch");
-      return "";
-    }
+    if (!UNSPLASH_ACCESS_KEY) return "";
 
-    const searchQuery = `${recipeName}`;
     const response = await fetch(
       `https://api.unsplash.com/search/photos?query=${encodeURIComponent(
-        searchQuery
+        recipeName
       )}&per_page=1&orientation=landscape`,
       {
         headers: {
           Authorization: `Client-ID ${UNSPLASH_ACCESS_KEY}`,
         },
+        cache: "no-store",
       }
     );
 
-    if (!response.ok) {
-      console.error("❌ Unsplash API error:", response.statusText);
-      return "";
-    }
+    if (!response.ok) return "";
 
     const data = await response.json();
 
-    if (data.results && data.results.length > 0) {
-      const photo = data.results[0];
-      console.log("✅ Found Unsplash image:", photo.urls.regular);
-      return photo.urls.regular;
-    }
-
-    console.log("ℹ️ No Unsplash image found for:", recipeName);
-    return "";
+    return data?.results?.[0]?.urls?.regular || "";
   } catch (error) {
-    console.error("❌ Error fetching Unsplash image:", error);
+    console.error("Unsplash error:", error);
     return "";
   }
 }
 
-// Get or generate recipe details
+// -----------------------------
+// Gemini helper
+// -----------------------------
+
+async function generateGemini(prompt) {
+  if (!GEMINI_API_KEY) {
+    throw new Error("GEMINI_API_KEY is missing");
+  }
+
+  const result = await genAI.models.generateContent({
+    model: GEMINI_MODEL,
+    contents: prompt,
+  });
+
+  return result.text || "";
+}
+
+// -----------------------------
+// Generate / Get Recipe
+// -----------------------------
+
 export async function getOrGenerateRecipe(formData) {
   try {
+    console.log("🚀 getOrGenerateRecipe started");
+
     const user = await checkUser();
+
     if (!user) {
       throw new Error("User not authenticated");
     }
 
     const recipeName = formData.get("recipeName");
+
     if (!recipeName) {
       throw new Error("Recipe name is required");
     }
 
-    // Normalize the title (e.g., "apple cake" → "Apple Cake")
     const normalizedTitle = normalizeTitle(recipeName);
-    console.log("🔍 Searching for recipe:", normalizedTitle);
-
     const isPro = user.subscriptionTier === "pro";
 
-    // Step 1: Check if recipe already exists in DB (case-insensitive search)
+    console.log("🔍 Searching:", normalizedTitle);
+
+    // -----------------------------
+    // 1. Search Strapi
+    // -----------------------------
+
     const searchResponse = await fetch(
       `${STRAPI_URL}/api/recipes?filters[title][$eqi]=${encodeURIComponent(
         normalizedTitle
@@ -98,12 +191,11 @@ export async function getOrGenerateRecipe(formData) {
     if (searchResponse.ok) {
       const searchData = await searchResponse.json();
 
-      if (searchData.data && searchData.data.length > 0) {
-        console.log("✅ Recipe found in database:", searchData.data[0].id);
+      if (searchData?.data?.length > 0) {
+        const recipe = searchData.data[0];
 
-        // Check if user has saved this recipe
-        const savedRecipeResponse = await fetch(
-          `${STRAPI_URL}/api/saved-recipes?filters[user][id][$eq]=${user.id}&filters[recipe][id][$eq]=${searchData.data[0].id}`,
+        const savedResponse = await fetch(
+          `${STRAPI_URL}/api/saved-recipes?filters[user][id][$eq]=${user.id}&filters[recipe][id][$eq]=${recipe.id}`,
           {
             headers: {
               Authorization: `Bearer ${STRAPI_API_TOKEN}`,
@@ -113,16 +205,17 @@ export async function getOrGenerateRecipe(formData) {
         );
 
         let isSaved = false;
-        if (savedRecipeResponse.ok) {
-          const savedData = await savedRecipeResponse.json();
-          isSaved = savedData.data && savedData.data.length > 0;
+
+        if (savedResponse.ok) {
+          const savedData = await savedResponse.json();
+          isSaved = savedData?.data?.length > 0;
         }
 
         return {
           success: true,
-          recipe: searchData.data[0],
-          recipeId: searchData.data[0].id,
-          isSaved: isSaved,
+          recipe,
+          recipeId: recipe.id,
+          isSaved,
           fromDatabase: true,
           isPro,
           message: "Recipe loaded from database",
@@ -130,160 +223,140 @@ export async function getOrGenerateRecipe(formData) {
       }
     }
 
-    // Step 2: Recipe doesn't exist, generate with Gemini
-    console.log("🤖 Recipe not found, generating with Gemini...");
+    // -----------------------------
+    // 2. Gemini
+    // -----------------------------
 
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-lite" });
+    console.log("🤖 Generating recipe with Gemini...");
 
     const prompt = `
-You are a professional chef and recipe expert. Generate a detailed recipe for: "${normalizedTitle}"
+You are a professional chef and recipe expert.
 
-CRITICAL: The "title" field MUST be EXACTLY: "${normalizedTitle}" (no changes, no additions like "Classic" or "Easy")
+Generate a detailed recipe for "${normalizedTitle}".
 
-Return ONLY a valid JSON object with this exact structure (no markdown, no explanations):
+Return ONLY valid JSON.
+
 {
   "title": "${normalizedTitle}",
-  "description": "Brief 2-3 sentence description of the dish",
-  "category": "Must be ONE of these EXACT values: breakfast, lunch, dinner, snack, dessert",
-  "cuisine": "Must be ONE of these EXACT values: italian, chinese, mexican, indian, american, thai, japanese, mediterranean, french, korean, vietnamese, spanish, greek, turkish, moroccan, brazilian, caribbean, middle-eastern, british, german, portuguese, other",
-  "prepTime": "Time in minutes (number only)",
-  "cookTime": "Time in minutes (number only)",
-  "servings": "Number of servings (number only)",
+  "description": "Brief description",
+  "category": "breakfast|lunch|dinner|snack|dessert",
+  "cuisine": "italian|chinese|mexican|indian|american|thai|japanese|mediterranean|french|korean|vietnamese|spanish|greek|turkish|moroccan|brazilian|caribbean|middle-eastern|british|german|portuguese|other",
+  "prepTime": 20,
+  "cookTime": 30,
+  "servings": 4,
   "ingredients": [
     {
-      "item": "ingredient name",
-      "amount": "quantity with unit",
+      "item": "ingredient",
+      "amount": "quantity",
       "category": "Protein|Vegetable|Spice|Dairy|Grain|Other"
     }
   ],
   "instructions": [
     {
       "step": 1,
-      "title": "Brief step title",
-      "instruction": "Detailed step instruction",
-      "tip": "Optional cooking tip for this step"
+      "title": "Step title",
+      "instruction": "Detailed instruction",
+      "tip": "Optional tip"
     }
   ],
   "nutrition": {
-    "calories": "calories per serving",
-    "protein": "grams",
-    "carbs": "grams",
-    "fat": "grams"
+    "calories": "300",
+    "protein": "15g",
+    "carbs": "30g",
+    "fat": "10g"
   },
   "tips": [
-    "General cooking tip 1",
-    "General cooking tip 2",
-    "General cooking tip 3"
+    "Cooking tip"
   ],
   "substitutions": [
     {
-      "original": "ingredient name",
-      "alternatives": ["substitute 1", "substitute 2"]
+      "original": "ingredient",
+      "alternatives": ["alternative"]
     }
   ]
 }
 
-IMPORTANT RULES FOR CATEGORY:
-- Breakfast items (pancakes, eggs, cereal, etc.) → "breakfast"
-- Main meals for midday (sandwiches, salads, pasta, etc.) → "lunch"
-- Main meals for evening (heavier dishes, roasts, etc.) → "dinner"
-- Light items between meals (chips, crackers, fruit, etc.) → "snack"
-- Sweet treats (cakes, cookies, ice cream, etc.) → "dessert"
+Rules:
 
-IMPORTANT RULES FOR CUISINE:
-- Use lowercase only
-- Pick the closest match from the allowed values
-- If uncertain, use "other"
-
-Guidelines:
-- Make ingredients realistic and commonly available
-- Instructions should be clear and beginner-friendly
-- Include 6-10 detailed steps
-- Provide practical cooking tips
-- Estimate realistic cooking times
-- Keep total instructions under 12 steps
+- title must be exactly "${normalizedTitle}"
+- category must be one allowed category
+- cuisine must be one allowed cuisine
+- 6-10 instruction steps
+- realistic ingredients
+- beginner friendly
+- realistic cooking times
+- Return ONLY JSON.
 `;
 
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    const text = response.text();
+    const text = await generateGemini(prompt);
 
-    // Parse JSON response
     let recipeData;
+
     try {
-      const cleanText = text
-        .replace(/```json\n?/g, "")
-        .replace(/```\n?/g, "")
-        .trim();
-      recipeData = JSON.parse(cleanText);
-    } catch (parseError) {
-      console.error("Failed to parse Gemini response:", text);
-      throw new Error("Failed to generate recipe. Please try again.");
+      recipeData = JSON.parse(cleanGeminiJSON(text));
+    } catch (error) {
+      console.error("Gemini JSON error:", text);
+      throw new Error("Gemini returned invalid recipe data");
     }
 
-    // FORCE the title to be our normalized version
+    // -----------------------------
+    // 3. Normalize
+    // -----------------------------
+
+    const category = normalizeCategory(recipeData.category);
+    const cuisine = normalizeCuisine(recipeData.cuisine);
+
     recipeData.title = normalizedTitle;
+    recipeData.category = category;
+    recipeData.cuisine = cuisine;
 
-    // Validate and sanitize category
-    const validCategories = [
-      "breakfast",
-      "lunch",
-      "dinner",
-      "snack",
-      "dessert",
-    ];
-    const category = validCategories.includes(
-      recipeData.category?.toLowerCase()
+    recipeData.ingredients = Array.isArray(
+      recipeData.ingredients
     )
-      ? recipeData.category.toLowerCase()
-      : "dinner";
+      ? recipeData.ingredients
+      : [];
 
-    // Validate and sanitize cuisine
-    const validCuisines = [
-      "italian",
-      "chinese",
-      "mexican",
-      "indian",
-      "american",
-      "thai",
-      "japanese",
-      "mediterranean",
-      "french",
-      "korean",
-      "vietnamese",
-      "spanish",
-      "greek",
-      "turkish",
-      "moroccan",
-      "brazilian",
-      "caribbean",
-      "middle-eastern",
-      "british",
-      "german",
-      "portuguese",
-      "other",
-    ];
-    const cuisine = validCuisines.includes(recipeData.cuisine?.toLowerCase())
-      ? recipeData.cuisine.toLowerCase()
-      : "other";
+    recipeData.instructions = Array.isArray(
+      recipeData.instructions
+    )
+      ? recipeData.instructions
+      : [];
 
-    // Step 3: Fetch image from Unsplash
-    console.log("🖼️ Fetching image from Unsplash...");
-    const imageUrl = await fetchRecipeImage(normalizedTitle);
+    recipeData.tips = Array.isArray(recipeData.tips)
+      ? recipeData.tips
+      : [];
 
-    // Step 4: Save generated recipe to database
+    recipeData.substitutions = Array.isArray(
+      recipeData.substitutions
+    )
+      ? recipeData.substitutions
+      : [];
+
+    // -----------------------------
+    // 4. Unsplash
+    // -----------------------------
+
+    console.log("🖼️ Fetching recipe image...");
+
+    const imageUrl =
+      await fetchRecipeImage(normalizedTitle);
+
+    // -----------------------------
+    // 5. Save to Strapi
+    // -----------------------------
+
     const strapiRecipeData = {
       data: {
         title: normalizedTitle,
-        description: recipeData.description,
+        description: recipeData.description || "",
         cuisine,
         category,
         ingredients: recipeData.ingredients,
         instructions: recipeData.instructions,
-        prepTime: Number(recipeData.prepTime),
-        cookTime: Number(recipeData.cookTime),
-        servings: Number(recipeData.servings),
-        nutrition: recipeData.nutrition,
+        prepTime: Number(recipeData.prepTime) || 0,
+        cookTime: Number(recipeData.cookTime) || 0,
+        servings: Number(recipeData.servings) || 1,
+        nutrition: recipeData.nutrition || {},
         tips: recipeData.tips,
         substitutions: recipeData.substitutions,
         imageUrl: imageUrl || "",
@@ -292,28 +365,41 @@ Guidelines:
       },
     };
 
-    console.log(
-      "📤 Saving new recipe to database with title:",
-      normalizedTitle
+    console.log("📤 Saving recipe...");
+    console.log("Cuisine:", cuisine);
+
+    const createResponse = await fetch(
+      `${STRAPI_URL}/api/recipes`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${STRAPI_API_TOKEN}`,
+        },
+        body: JSON.stringify(strapiRecipeData),
+      }
     );
 
-    const createRecipeResponse = await fetch(`${STRAPI_URL}/api/recipes`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${STRAPI_API_TOKEN}`,
-      },
-      body: JSON.stringify(strapiRecipeData),
-    });
+    if (!createResponse.ok) {
+      const errorText = await createResponse.text();
 
-    if (!createRecipeResponse.ok) {
-      const errorText = await createRecipeResponse.text();
-      console.error("❌ Failed to save recipe:", errorText);
-      throw new Error("Failed to save recipe to database");
+      console.error(
+        "❌ Strapi save failed:",
+        errorText
+      );
+
+      throw new Error(
+        `Strapi save failed (${createResponse.status}): ${errorText}`
+      );
     }
 
-    const createdRecipe = await createRecipeResponse.json();
-    console.log("✅ Recipe saved to database:", createdRecipe.data.id);
+    const createdRecipe =
+      await createResponse.json();
+
+    console.log(
+      "✅ Recipe saved:",
+      createdRecipe?.data?.id
+    );
 
     return {
       success: true,
@@ -324,33 +410,48 @@ Guidelines:
         cuisine,
         imageUrl: imageUrl || "",
       },
-      recipeId: createdRecipe.data.id,
+      recipeId: createdRecipe?.data?.id,
       isSaved: false,
       fromDatabase: false,
-      recommendationsLimit: isPro ? "unlimited" : 5,
+      recommendationsLimit: isPro
+        ? "unlimited"
+        : 5,
       isPro,
-      message: "Recipe generated and saved successfully!",
+      message:
+        "Recipe generated and saved successfully!",
     };
   } catch (error) {
-    console.error("❌ Error in getOrGenerateRecipe:", error);
-    throw new Error(error.message || "Failed to load recipe");
+    console.error(
+      "❌ getOrGenerateRecipe:",
+      error
+    );
+
+    throw new Error(
+      error?.message || "Failed to load recipe"
+    );
   }
 }
 
-// Save recipe to user's collection (bookmark)
-export async function saveRecipeToCollection(formData) {
+// -----------------------------
+// Save Recipe
+// -----------------------------
+
+export async function saveRecipeToCollection(
+  formData
+) {
   try {
     const user = await checkUser();
+
     if (!user) {
       throw new Error("User not authenticated");
     }
 
     const recipeId = formData.get("recipeId");
+
     if (!recipeId) {
       throw new Error("Recipe ID is required");
     }
 
-    // Check if already saved
     const existingResponse = await fetch(
       `${STRAPI_URL}/api/saved-recipes?filters[user][id][$eq]=${user.id}&filters[recipe][id][$eq]=${recipeId}`,
       {
@@ -362,68 +463,88 @@ export async function saveRecipeToCollection(formData) {
     );
 
     if (existingResponse.ok) {
-      const existingData = await existingResponse.json();
-      if (existingData.data && existingData.data.length > 0) {
+      const data =
+        await existingResponse.json();
+
+      if (data?.data?.length > 0) {
         return {
           success: true,
           alreadySaved: true,
-          message: "Recipe is already in your collection",
+          message: "Recipe is already saved",
         };
       }
     }
 
-    // Create saved recipe relation
-    const saveResponse = await fetch(`${STRAPI_URL}/api/saved-recipes`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${STRAPI_API_TOKEN}`,
-      },
-      body: JSON.stringify({
-        data: {
-          user: user.id,
-          recipe: recipeId,
-          savedAt: new Date().toISOString(),
+    const response = await fetch(
+      `${STRAPI_URL}/api/saved-recipes`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${STRAPI_API_TOKEN}`,
         },
-      }),
-    });
+        body: JSON.stringify({
+          data: {
+            user: user.id,
+            recipe: recipeId,
+            savedAt: new Date().toISOString(),
+          },
+        }),
+      }
+    );
 
-    if (!saveResponse.ok) {
-      const errorText = await saveResponse.text();
-      console.error("❌ Failed to save recipe:", errorText);
-      throw new Error("Failed to save recipe to collection");
+    if (!response.ok) {
+      const errorText =
+        await response.text();
+
+      throw new Error(
+        `Failed to save recipe: ${errorText}`
+      );
     }
 
-    const savedRecipe = await saveResponse.json();
-    console.log("✅ Recipe saved to user collection:", savedRecipe.data.id);
+    const savedRecipe =
+      await response.json();
 
     return {
       success: true,
       alreadySaved: false,
       savedRecipe: savedRecipe.data,
-      message: "Recipe saved to your collection!",
+      message:
+        "Recipe saved to your collection!",
     };
   } catch (error) {
-    console.error("❌ Error saving recipe to collection:", error);
-    throw new Error(error.message || "Failed to save recipe");
+    console.error(
+      "Save recipe error:",
+      error
+    );
+
+    throw new Error(
+      error?.message || "Failed to save recipe"
+    );
   }
 }
 
-// Remove recipe from user's collection (unbookmark)
-export async function removeRecipeFromCollection(formData) {
+// -----------------------------
+// Remove Recipe
+// -----------------------------
+
+export async function removeRecipeFromCollection(
+  formData
+) {
   try {
     const user = await checkUser();
+
     if (!user) {
       throw new Error("User not authenticated");
     }
 
     const recipeId = formData.get("recipeId");
+
     if (!recipeId) {
       throw new Error("Recipe ID is required");
     }
 
-    // Find saved recipe relation
-    const searchResponse = await fetch(
+    const response = await fetch(
       `${STRAPI_URL}/api/saved-recipes?filters[user][id][$eq]=${user.id}&filters[recipe][id][$eq]=${recipeId}`,
       {
         headers: {
@@ -433,23 +554,25 @@ export async function removeRecipeFromCollection(formData) {
       }
     );
 
-    if (!searchResponse.ok) {
-      throw new Error("Failed to find saved recipe");
+    if (!response.ok) {
+      throw new Error(
+        "Failed to find saved recipe"
+      );
     }
 
-    const searchData = await searchResponse.json();
+    const data = await response.json();
 
-    if (!searchData.data || searchData.data.length === 0) {
+    if (!data?.data?.length) {
       return {
         success: true,
-        message: "Recipe was not in your collection",
+        message: "Recipe was not saved",
       };
     }
 
-    // Delete saved recipe relation
-    const savedRecipeId = searchData.data[0].id;
+    const savedId = data.data[0].id;
+
     const deleteResponse = await fetch(
-      `${STRAPI_URL}/api/saved-recipes/${savedRecipeId}`,
+      `${STRAPI_URL}/api/saved-recipes/${savedId}`,
       {
         method: "DELETE",
         headers: {
@@ -459,53 +582,64 @@ export async function removeRecipeFromCollection(formData) {
     );
 
     if (!deleteResponse.ok) {
-      throw new Error("Failed to remove recipe from collection");
+      throw new Error(
+        "Failed to remove recipe"
+      );
     }
-
-    console.log("✅ Recipe removed from user collection");
 
     return {
       success: true,
-      message: "Recipe removed from your collection",
+      message:
+        "Recipe removed from your collection",
     };
   } catch (error) {
-    console.error("❌ Error removing recipe from collection:", error);
-    throw new Error(error.message || "Failed to remove recipe");
+    console.error(
+      "Remove recipe error:",
+      error
+    );
+
+    throw new Error(
+      error?.message ||
+        "Failed to remove recipe"
+    );
   }
 }
 
-// Get recipes based on pantry ingredients
+// -----------------------------
+// Pantry Recommendations
+// -----------------------------
+
 export async function getRecipesByPantryIngredients() {
   try {
     const user = await checkUser();
+
     if (!user) {
       throw new Error("User not authenticated");
     }
 
-    // ✅ ARCJET RATE LIMIT CHECK
-    const isPro = user.subscriptionTier === "pro";
-    const arcjetClient = isPro ? proTierLimit : freeMealRecommendations;
+    const isPro =
+      user.subscriptionTier === "pro";
 
-    // Create a request object for Arcjet
+    const arcjetClient = isPro
+      ? proTierLimit
+      : freeMealRecommendations;
+
     const req = await request();
 
-    const decision = await arcjetClient.protect(req, {
-      userId: user.clerkId,
-      requested: 1,
-    });
+    const decision =
+      await arcjetClient.protect(req, {
+        userId: user.clerkId,
+        requested: 1,
+      });
 
     if (decision.isDenied()) {
-      if (decision.reason.isRateLimit()) {
-        throw new Error(
-          `Monthly AI recipe limit reached. ${
-            isPro ? "Please contact support." : "Upgrade to Pro!"
-          }`
-        );
-      }
-      throw new Error("Request denied");
+      throw new Error(
+        isPro
+          ? "Monthly AI recipe limit reached."
+          : "Monthly AI recipe limit reached. Upgrade to Pro!"
+      );
     }
 
-    // Get user's pantry items
     const pantryResponse = await fetch(
       `${STRAPI_URL}/api/pantry-items?filters[owner][id][$eq]=${user.id}`,
       {
@@ -517,38 +651,45 @@ export async function getRecipesByPantryIngredients() {
     );
 
     if (!pantryResponse.ok) {
-      throw new Error("Failed to fetch pantry items");
+      throw new Error(
+        "Failed to fetch pantry items"
+      );
     }
 
-    const pantryData = await pantryResponse.json();
+    const pantryData =
+      await pantryResponse.json();
 
-    if (!pantryData.data || pantryData.data.length === 0) {
+    if (!pantryData?.data?.length) {
       return {
         success: false,
-        message: "Your pantry is empty. Add ingredients first!",
+        message:
+          "Your pantry is empty. Add ingredients first!",
       };
     }
 
-    const ingredients = pantryData.data.map((item) => item.name).join(", ");
-
-    console.log("🥘 Finding recipes for ingredients:", ingredients);
-
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-lite" });
+    const ingredients = pantryData.data
+      .map((item) => item.name)
+      .filter(Boolean)
+      .join(", ");
 
     const prompt = `
-You are a professional chef. Given these available ingredients: ${ingredients}
+You are a professional chef.
 
-Suggest 5 recipes that can be made primarily with these ingredients. It's okay if the recipes need 1-2 common pantry staples (salt, pepper, oil, etc.) that aren't listed.
+Available ingredients:
+${ingredients}
 
-Return ONLY a valid JSON array (no markdown, no explanations):
+Suggest 5 realistic recipes.
+
+Return ONLY valid JSON array:
+
 [
   {
     "title": "Recipe name",
-    "description": "Brief 1-2 sentence description",
+    "description": "Short description",
     "matchPercentage": 85,
-    "missingIngredients": ["ingredient1", "ingredient2"],
+    "missingIngredients": ["ingredient"],
     "category": "breakfast|lunch|dinner|snack|dessert",
-    "cuisine": "italian|chinese|mexican|etc",
+    "cuisine": "indian",
     "prepTime": 20,
     "cookTime": 30,
     "servings": 4
@@ -556,27 +697,30 @@ Return ONLY a valid JSON array (no markdown, no explanations):
 ]
 
 Rules:
-- matchPercentage should be 70-100% (how many listed ingredients are used)
-- missingIngredients should be common items or optional additions
-- Sort by matchPercentage descending
-- Make recipes realistic and delicious
+
+- matchPercentage must be 70-100
+- prioritize available ingredients
+- recipes should be realistic
+- Return ONLY JSON.
 `;
 
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    const text = response.text();
+    const text =
+      await generateGemini(prompt);
 
     let recipeSuggestions;
+
     try {
-      const cleanText = text
-        .replace(/```json\n?/g, "")
-        .replace(/```\n?/g, "")
-        .trim();
-      recipeSuggestions = JSON.parse(cleanText);
-    } catch (parseError) {
-      console.error("Failed to parse Gemini response:", text);
+      recipeSuggestions = JSON.parse(
+        cleanGeminiJSON(text)
+      );
+    } catch (error) {
+      console.error(
+        "Pantry Gemini JSON error:",
+        text
+      );
+
       throw new Error(
-        "Failed to generate recipe suggestions. Please try again."
+        "Gemini returned invalid recommendation data"
       );
     }
 
@@ -584,24 +728,36 @@ Rules:
       success: true,
       recipes: recipeSuggestions,
       ingredientsUsed: ingredients,
-      recommendationsLimit: isPro ? "unlimited" : 5,
+      recommendationsLimit: isPro
+        ? "unlimited"
+        : 5,
       message: `Found ${recipeSuggestions.length} recipes you can make!`,
     };
   } catch (error) {
-    console.error("❌ Error in getRecipesByPantryIngredients:", error);
-    throw new Error(error.message || "Failed to get recipe suggestions");
+    console.error(
+      "❌ getRecipesByPantryIngredients:",
+      error
+    );
+
+    throw new Error(
+      error?.message ||
+        "Failed to get recipe suggestions"
+    );
   }
 }
 
-// Get user's saved recipes
+// -----------------------------
+// Saved Recipes
+// -----------------------------
+
 export async function getSavedRecipes() {
   try {
     const user = await checkUser();
+
     if (!user) {
       throw new Error("User not authenticated");
     }
 
-    // Fetch saved recipes with populated recipe data
     const response = await fetch(
       `${STRAPI_URL}/api/saved-recipes?filters[user][id][$eq]=${user.id}&populate[recipe][populate]=*&sort=savedAt:desc`,
       {
@@ -613,15 +769,22 @@ export async function getSavedRecipes() {
     );
 
     if (!response.ok) {
-      throw new Error("Failed to fetch saved recipes");
+      const errorText =
+        await response.text();
+
+      throw new Error(
+        `Failed to fetch saved recipes: ${errorText}`
+      );
     }
 
     const data = await response.json();
 
-    // Extract recipes from saved-recipes relations
-    const recipes = data.data
-      .map((savedRecipe) => savedRecipe.recipe)
-      .filter(Boolean); // Remove any null recipes
+    const recipes = (data?.data || [])
+      .map(
+        (savedRecipe) =>
+          savedRecipe.recipe
+      )
+      .filter(Boolean);
 
     return {
       success: true,
@@ -629,7 +792,14 @@ export async function getSavedRecipes() {
       count: recipes.length,
     };
   } catch (error) {
-    console.error("Error fetching saved recipes:", error);
-    throw new Error(error.message || "Failed to load saved recipes");
+    console.error(
+      "Get saved recipes error:",
+      error
+    );
+
+    throw new Error(
+      error?.message ||
+        "Failed to load saved recipes"
+    );
   }
 }

@@ -58,12 +58,12 @@ export async function getAreas() {
     }
 
     const data = await response.json();
-    
+
     // Deduplicate areas by strArea to prevent duplicate keys in rendering
     const uniqueAreas = Array.from(
       new Map((data.meals || []).map(area => [area.strArea, area])).values()
     );
-    
+
     return {
       success: true,
       areas: uniqueAreas,
