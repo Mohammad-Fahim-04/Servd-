@@ -1,3 +1,4 @@
+
 "use client";
 
 import * as React from "react";
@@ -16,13 +17,18 @@ function Dialog({ ...props }) {
   );
 }
 
-function DialogTrigger({ children, ...props }) {
+function DialogTrigger({
+  children,
+  asChild = false,
+  ...props
+}) {
   return (
     <DialogPrimitive.Trigger
       data-slot="dialog-trigger"
+      render={asChild ? children : undefined}
       {...props}
     >
-      {children}
+      {!asChild && children}
     </DialogPrimitive.Trigger>
   );
 }
@@ -36,7 +42,10 @@ function DialogPortal({ ...props }) {
   );
 }
 
-function DialogClose({ children, ...props }) {
+function DialogClose({
+  children,
+  ...props
+}) {
   return (
     <DialogPrimitive.Close
       data-slot="dialog-close"
@@ -47,7 +56,10 @@ function DialogClose({ children, ...props }) {
   );
 }
 
-function DialogOverlay({ className, ...props }) {
+function DialogOverlay({
+  className,
+  ...props
+}) {
   return (
     <DialogPrimitive.Backdrop
       data-slot="dialog-overlay"
@@ -188,3 +200,4 @@ export {
   DialogTitle,
   DialogTrigger,
 };
+
